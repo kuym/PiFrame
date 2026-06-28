@@ -18,11 +18,38 @@ Usage:
 
 Note that PiFrame uses GTK+ and is intended for the Raspberry Pi but is not exclusive to that platform.  With trivial adjustment it should work on any Linux/GTK+ platform.
 
+There is also a framebuffer edition (`client/main-fb.c`) for headless embedded systems with no window manager or GTK+ available (for example the original Raspberry Pi Zero).  It behaves identically but uses only libcurl, libjpeg and libpng, decoding each image itself and rendering directly to the Linux framebuffer (e.g. `/dev/fb0`).  It supports PNG and JPEG images.
+
+    ./piframe-fb "http://example.server.url/nextPhoto"
+
 ## Building
 
-Right now, the PiFrame client is a single C source file.  Compile it as so:
+### Setup (Linux / Raspberry Pi OS)
+
+Install the build tools and the development packages PiFrame depends on.  On Debian-based systems (including Raspberry Pi OS / Raspbian):
+
+    sudo apt-get update
+    sudo apt-get install build-essential pkg-config
+
+For the framebuffer edition (`client/main-fb.c`):
+
+    sudo apt-get install libpng-dev libjpeg-dev libcurl4-openssl-dev
+
+For the GTK+ edition (`client/main.c`), also install:
+
+    sudo apt-get install libgtk-3-dev
+
+### Compiling
+
+The GTK+ client is a single C source file.  Compile it as so:
 
     gcc -o piframe -O3 $(pkg-config --cflags gtk+-3.0) $(pkg-config --libs gtk+-3.0) $(pkg-config --cflags libcurl) $(pkg-config --libs libcurl) client/main.c
+
+The framebuffer client is likewise a single C source file.  On Raspbian (which ships libjpeg-turbo and libpng) compile it as so:
+
+    gcc -o piframe-fb -O3 client/main-fb.c $(pkg-config --cflags --libs libcurl libpng) -ljpeg -lm
+
+The framebuffer edition needs no X server or GTK+.  It puts the active console into graphics mode while running (restoring it on exit) and accepts a couple of extra options: `-f <device>` selects the framebuffer (default `/dev/fb0`) and `-s <file>` selects the startup image (default `startup.jpg`).
 
 
 ## Useful tricks for Raspberry Pi:
