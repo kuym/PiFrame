@@ -1,0 +1,13 @@
+# Configuration for the PiFrame systemd service.
+#   This file is sourced by the service as environment variables.
+#   After editing, apply changes with: sudo systemctl restart piframe
+
+# The photo service endpoint to request images from (required).
+#   Tip: identify this instance to the server by parameterising the URL, e.g.
+#   PIFRAME_URL="http://10.0.0.84:3000/v1/nextPhoto?id=livingroom"
+PIFRAME_URL="http://example.server.url/nextPhoto"
+
+# Extra command-line options. Examples:
+#   -d 5000        minimum milliseconds between photos
+#   -f /dev/fb1    use a different framebuffer  (framebuffer build only)
+PIFRAME_OPTS=""

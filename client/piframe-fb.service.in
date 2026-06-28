@@ -1,0 +1,27 @@
+[Unit]
+Description=PiFrame networked digital picture frame (framebuffer)
+Documentation=https://github.com/
+# Wait for the network so the very first photo request can succeed.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Configuration (PIFRAME_URL, PIFRAME_OPTS) lives in /etc/default/piframe.
+#   The leading '-' makes the file optional so the unit still starts if it
+#   is missing (the service will simply have no URL to fetch).
+EnvironmentFile=-/etc/default/piframe
+
+# The framebuffer edition decodes and draws everything itself, so it needs
+#   no X server.  It does need the framebuffer device and the console TTY
+#   (to switch the console into graphics mode), so it runs as root.
+User=root
+ExecStart=@PREFIX@/bin/piframe-fb $PIFRAME_OPTS -s @PREFIX@/share/piframe/startup.jpg $PIFRAME_URL
+
+# Keep the frame alive: restart if it ever exits (e.g. transient errors).
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

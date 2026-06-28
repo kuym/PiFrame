@@ -1,0 +1,31 @@
+[Unit]
+Description=PiFrame networked digital picture frame (GTK+)
+# The GTK+ edition needs a running X session, so start after the graphical
+#   target.  This assumes the Pi is configured to boot to the desktop with
+#   autologin (raspi-config -> System Options -> Boot / Auto Login -> Desktop
+#   Autologin).  For a headless Pi (e.g. the Pi Zero) prefer the framebuffer
+#   edition instead - see "make install-fb".
+After=graphical.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+
+# Configuration (PIFRAME_URL, PIFRAME_OPTS) lives in /etc/default/piframe.
+EnvironmentFile=-/etc/default/piframe
+
+# Run inside the desktop user's X session.  Adjust User/XAUTHORITY if your
+#   autologin user is not "pi".
+User=pi
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+
+# The GTK+ edition loads its startup image from the working directory.
+WorkingDirectory=@PREFIX@/share/piframe
+ExecStart=@PREFIX@/bin/piframe $PIFRAME_OPTS $PIFRAME_URL
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

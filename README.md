@@ -41,15 +41,49 @@ For the GTK+ edition (`client/main.c`), also install:
 
 ### Compiling
 
-The GTK+ client is a single C source file.  Compile it as so:
+A `Makefile` builds both editions:
+
+    make            # builds both: piframe (GTK+) and piframe-fb (framebuffer)
+    make piframe    # GTK+ edition only
+    make piframe-fb # framebuffer edition only
+
+Or compile a single source file by hand.  The GTK+ client:
 
     gcc -o piframe -O3 $(pkg-config --cflags gtk+-3.0) $(pkg-config --libs gtk+-3.0) $(pkg-config --cflags libcurl) $(pkg-config --libs libcurl) client/main.c
 
-The framebuffer client is likewise a single C source file.  On Raspbian (which ships libjpeg-turbo and libpng) compile it as so:
+The framebuffer client (on Raspbian, which ships libjpeg-turbo and libpng):
 
     gcc -o piframe-fb -O3 client/main-fb.c $(pkg-config --cflags --libs libcurl libpng) -ljpeg -lm
 
 The framebuffer edition needs no X server or GTK+.  It puts the active console into graphics mode while running (restoring it on exit) and accepts a couple of extra options: `-f <device>` selects the framebuffer (default `/dev/fb0`) and `-s <file>` selects the startup image (default `startup.jpg`).
+
+
+## Running at startup (systemd)
+
+The `Makefile` can install either edition as a systemd service so the frame starts automatically at boot.  For a headless Pi (e.g. the Pi Zero), install the framebuffer edition:
+
+    sudo make install-fb
+
+For a Pi booting to the desktop (with autologin), you can instead install the GTK+ edition:
+
+    sudo make install-gtk
+
+Either command builds the chosen edition, installs the binary to `/usr/local/bin`, the startup image to `/usr/local/share/piframe/`, a config file to `/etc/default/piframe`, and a `piframe.service` unit to `/etc/systemd/system/`, then enables it (so it starts on boot).  The two editions share the single unit name `piframe.service`, so installing one replaces the other.
+
+Set the photo service URL (and any extra options) by editing the config file, then start the service:
+
+    sudo nano /etc/default/piframe      # set PIFRAME_URL=...
+    sudo systemctl start piframe
+
+    journalctl -u piframe -f            # follow its log output
+
+To override the install prefix, pass `PREFIX` (e.g. `sudo make install-fb PREFIX=/usr`).  To remove everything:
+
+    sudo make uninstall
+
+### Hiding the boot console (optional)
+
+On a dedicated frame you'll usually want a clean boot with no login prompt, blinking cursor or kernel messages bleeding through.  The included `setup.sh` script disables the `tty1` getty, quiets the kernel command line and silences `dmesg` on the console.  Review it first, then run it with `sudo sh setup.sh` and reboot.
 
 
 ## Useful tricks for Raspberry Pi:
