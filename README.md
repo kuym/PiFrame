@@ -57,6 +57,10 @@ The framebuffer client (on Raspbian, which ships libjpeg-turbo and libpng):
 
 The framebuffer edition needs no X server or GTK+.  It puts the active console into graphics mode while running (restoring it on exit) and accepts a couple of extra options: `-f <device>` selects the framebuffer (default `/dev/fb0`) and `-s <file>` selects the startup image (default `startup.jpg`).
 
+### Diagnostic HUD (framebuffer edition)
+
+When something goes wrong — the server is unreachable, a request times out, the server returns an HTTP error, an HTTPS/TLS handshake fails, or the response isn't a decodable PNG/JPEG — the framebuffer edition overlays a heads-up display across the bottom ~1/6 of the screen.  The HUD is a 50%-opaque gray panel with white, black-outlined text (legible over any image) reporting the condition, the configured server URL, and the device's IP address.  It keeps showing the last good photo beneath the HUD and retries every 10 seconds; once a photo arrives again the HUD disappears.  This makes it easy to diagnose a frame on the wall without attaching a keyboard.
+
 
 ## Running at startup (systemd)
 
