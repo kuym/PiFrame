@@ -21,6 +21,15 @@ for param in quiet splash loglevel=0 logo.nologo vt.global_cursor_default=0; do
 	esac
 done
 
+# Force 1080p60 on HDMI and zero the overscan margins so the entire image is
+#   displayed (some TVs/monitors otherwise crop - "overscan" - the edges).
+#   This is a single space-free token (commas, not spaces).
+VIDEO="video=HDMI-A-1:1920x1080@60,margin_left=0,margin_right=0,margin_top=0,margin_bottom=0"
+case " $line " in
+	*" $VIDEO "*) ;;			# already present, leave it alone
+	*) line="$line $VIDEO" ;;	# not present, append it
+esac
+
 # Remove "console=tty1" so the kernel/getty don't draw on our display.
 new_line=""
 for token in $line; do
