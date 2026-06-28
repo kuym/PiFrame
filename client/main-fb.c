@@ -82,6 +82,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -203,12 +204,95 @@ static size_t	onCURLDownloadSegment(void* segment, size_t count, size_t elements
 }
 
 
+// Timeout policy.  The intent is to be "patient" while waiting for the
+//   server to *begin* responding (the long-poll model lets the server
+//   hold the connection open to control refresh timing) but "impatient"
+//   once it has begun - the response must then complete quickly so a
+//   stalled or trickling transfer can't wedge the frame indefinitely.
+typedef struct DownloadTimeouts
+{
+	long	generalSeconds;		// CURLOPT_TIMEOUT, whole request (0 = unlimited)
+	long	connectSeconds;		// CURLOPT_CONNECTTIMEOUT (0 = libcurl default)
+	double	responseSeconds;	// deadline AFTER the server begins responding (0 = unlimited)
+
+} DownloadTimeouts;
+
+
+// Per-transfer timing state shared by the header and progress callbacks.
+typedef struct TransferState
+{
+	int		responding;			// has the server begun to respond?
+	double	respondingAt;		// monotonic time (s) the response began
+	double	deadlineSeconds;	// allowed seconds from respondingAt to completion
+
+} TransferState;
+
+
+// Monotonic seconds; immune to wall-clock changes (NTP steps, etc.).
+static double	monotonicSeconds(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+}
+
+// libcurl invokes this for every received header line.  A status line
+//   ("HTTP/...") marks the start of a response, which begins (or, for a
+//   redirect chain / "100 Continue", restarts) the "impatient" completion
+//   clock - so the deadline is always measured from the final response.
+static size_t	onCURLHeader(char* buffer, size_t size, size_t nitems, void* user)
+{
+	size_t			length = size * nitems;
+	TransferState*	state = (TransferState*)user;
+
+	if(length >= 5 && memcmp(buffer, "HTTP/", 5) == 0)
+	{
+		state->responding = 1;
+		state->respondingAt = monotonicSeconds();
+	}
+	else if(!state->responding)	// defensive: any header means it's responding
+	{
+		state->responding = 1;
+		state->respondingAt = monotonicSeconds();
+	}
+
+	return(length);
+}
+
+// libcurl calls this periodically (at least ~once a second) throughout
+//   the transfer, including while idle.  We stay patient until the
+//   response begins, then enforce the completion deadline by returning
+//   non-zero (which aborts with CURLE_ABORTED_BY_CALLBACK).
+static int		onCURLProgress(void* user, curl_off_t dlTotal, curl_off_t dlNow, curl_off_t ulTotal, curl_off_t ulNow)
+{
+	(void)dlTotal; (void)ulTotal; (void)ulNow;
+	TransferState* state = (TransferState*)user;
+
+	// a body byte is also a clear sign the response has begun (covers
+	//   the rare case of body before any header callback)
+	if(!state->responding && dlNow > 0)
+	{
+		state->responding = 1;
+		state->respondingAt = monotonicSeconds();
+	}
+
+	if(state->responding && state->deadlineSeconds > 0.0 &&
+	   (monotonicSeconds() - state->respondingAt) > state->deadlineSeconds)
+	{
+		DebugPrintf("*onCURLProgress completion deadline exceeded, aborting\n");
+		return(1);	// -> CURLE_ABORTED_BY_CALLBACK
+	}
+
+	return(0);
+}
+
+
 // Download the given URL.  On success returns CURLE_OK and fills
 //   *outBuffer (caller frees outBuffer->data).  On failure returns
 //   the curl error code and leaves any partial buffer freed.  The
 //   HTTP status code (if any) is reported through *outStatus so the
 //   caller can describe HTTP-level failures in the on-screen HUD.
-static int		downloadURL(char const* url, MemoryBuffer* outBuffer, long* outStatus)
+static int		downloadURL(char const* url, MemoryBuffer* outBuffer, long* outStatus, DownloadTimeouts const* timeouts)
 {
 	DebugPrintf("+downloadURL %s\n", url);
 
@@ -232,6 +316,25 @@ static int		downloadURL(char const* url, MemoryBuffer* outBuffer, long* outStatu
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "piframe-1.0/libcurl");
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);	// treat HTTP >= 400 as an error
+
+	// overall and connect-phase timeouts
+	if(timeouts->generalSeconds > 0)
+		curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeouts->generalSeconds);
+	if(timeouts->connectSeconds > 0)
+		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeouts->connectSeconds);
+
+	// "impatient once responding" completion deadline, enforced via the
+	//   header + progress callbacks
+	TransferState state = { 0, 0.0, timeouts->responseSeconds };
+	if(timeouts->responseSeconds > 0.0)
+	{
+		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &onCURLHeader);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*)&state);
+
+		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &onCURLProgress);
+		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void*)&state);
+	}
 
 	int result = curl_easy_perform(curl);
 
@@ -928,25 +1031,45 @@ static void		drawTextOutlined(FrameBuffer* fb, uint8_t* dest, int x, int y, char
 }
 
 // Copy 'in' into 'out' truncated to at most maxChars glyphs, appending
-//   ".." when it had to be shortened (URLs can be long).
+//   ".." when it had to be shortened (URLs can be long).  Uses explicit
+//   bounded copies so the (intentional) truncation is obvious to both the
+//   reader and the compiler.
 static void		fitText(char* out, size_t outSize, char const* in, int maxChars)
 {
+	if(outSize == 0)
+		return;
+
 	if(maxChars < 1)
 		maxChars = 1;
 
-	if((int)strlen(in) <= maxChars)
+	// never write past the end of 'out', nor more than maxChars glyphs
+	size_t limit = outSize - 1;
+	if((size_t)maxChars < limit)
+		limit = (size_t)maxChars;
+
+	size_t inLen = strlen(in);
+
+	if(inLen <= limit)
 	{
-		snprintf(out, outSize, "%s", in);
+		memcpy(out, in, inLen);
+		out[inLen] = '\0';
 		return;
 	}
 
-	int keep = (maxChars > 2)? maxChars - 2 : 0;
-	if((size_t)keep >= outSize)
-		keep = (int)outSize - 1;
-
-	memcpy(out, in, (size_t)keep);
-	out[keep] = '\0';
-	strncat(out, "..", outSize - strlen(out) - 1);
+	// too long: keep what fits, ending with a ".." ellipsis
+	if(limit >= 2)
+	{
+		size_t keep = limit - 2;
+		memcpy(out, in, keep);
+		out[keep + 0] = '.';
+		out[keep + 1] = '.';
+		out[keep + 2] = '\0';
+	}
+	else
+	{
+		memcpy(out, in, limit);
+		out[limit] = '\0';
+	}
 }
 
 
@@ -965,7 +1088,9 @@ static void		drawHud(FrameBuffer* fb, uint8_t* dest, Hud const* hud)
 {
 	char lineServer[600];
 	char lineIP[80];
-	snprintf(lineServer, sizeof(lineServer), "Server: %s", (hud->url && hud->url[0])? hud->url : "(none)");
+	// bound the URL with an explicit precision so the (arbitrary-length)
+	//   URL can't overflow - and so the compiler can see it can't
+	snprintf(lineServer, sizeof(lineServer), "Server: %.591s", (hud->url && hud->url[0])? hud->url : "(none)");
 	snprintf(lineIP, sizeof(lineIP), "IP: %s", hud->ip);
 
 	char const* lines[3] = { hud->condition, lineServer, lineIP };
@@ -1131,6 +1256,10 @@ typedef struct AppOptions
 	char const*		startupImage;
 	unsigned int	delayMS;
 
+	unsigned int	generalTimeoutS;	// CURLOPT_TIMEOUT, whole request (0 = unlimited)
+	unsigned int	connectTimeoutS;	// connect-phase timeout
+	unsigned int	responseTimeoutS;	// completion deadline after the server begins responding
+
 } AppOptions;
 
 
@@ -1149,7 +1278,7 @@ static void		parseOptions(AppOptions* outOptions, int argc, char** argv)
 	optind = 1;
 
 	int c, i, haveURL = 0;
-	while((c = getopt(argc, argv, "d:f:s:")) != -1)
+	while((c = getopt(argc, argv, "d:f:s:t:T:c:")) != -1)
 	{
 		switch(c)
 		{
@@ -1161,6 +1290,15 @@ static void		parseOptions(AppOptions* outOptions, int argc, char** argv)
 			break;
 		case 's':	// startup image file
 			outOptions->startupImage = optarg;
+			break;
+		case 't':	// general (whole-request) timeout, seconds; 0 = unlimited
+			outOptions->generalTimeoutS = atoi(optarg);
+			break;
+		case 'T':	// completion deadline once the server begins responding, seconds; 0 = unlimited
+			outOptions->responseTimeoutS = atoi(optarg);
+			break;
+		case 'c':	// connect-phase timeout, seconds; 0 = libcurl default
+			outOptions->connectTimeoutS = atoi(optarg);
 			break;
 		}
 	}
@@ -1231,6 +1369,7 @@ static char const*	describeCurlError(int code)
 	case CURLE_COULDNT_RESOLVE_PROXY:	return("Cannot resolve server name");
 	case CURLE_COULDNT_CONNECT:			return("Server unreachable");
 	case CURLE_OPERATION_TIMEDOUT:		return("Connection timed out");
+	case CURLE_ABORTED_BY_CALLBACK:		return("Response stalled (timed out)");	// our completion deadline fired
 	case CURLE_SSL_CONNECT_ERROR:
 	case CURLE_SSL_CERTPROBLEM:
 	case CURLE_SSL_CACERT:				return("HTTPS / TLS error");	// modern curl merges peer-verification failures into CURLE_SSL_CACERT (60)
@@ -1264,8 +1403,22 @@ int		main(int argc, char** argv)
 		.framebufferDevice = "/dev/fb0",
 		.startupImage = "startup.jpg",
 		.delayMS = 1,
+
+		// Patient before the server responds (long-poll friendly), impatient
+		//   after: by default the whole request may take as long as the server
+		//   likes to *start*, but once it begins it must finish within a few
+		//   seconds.  Override with -t (whole request), -T (completion), -c (connect).
+		.generalTimeoutS = 600,		// ten-minute longest poll period
+		.connectTimeoutS = 30,		// bound DNS/TCP connect so an unreachable host fails
+		.responseTimeoutS = 8,		// once responding, must complete within 8s
 	};
 	parseOptions(&options, argc, argv);
+
+	// the completion deadline only makes sense if it's shorter than any overall
+	//   timeout; warn if the user inverted them (the shorter one wins anyway)
+	if(options.generalTimeoutS > 0 && options.responseTimeoutS > options.generalTimeoutS)
+		fprintf(stderr, "piframe: note: response timeout (%us) exceeds general timeout (%us)\n",
+			options.responseTimeoutS, options.generalTimeoutS);
 
 	curl_global_init(CURL_GLOBAL_ALL);
 
@@ -1304,6 +1457,13 @@ int		main(int argc, char** argv)
 
 	interruptibleSleepMS(5000);
 
+	DownloadTimeouts timeouts =
+	{
+		.generalSeconds  = (long)options.generalTimeoutS,
+		.connectSeconds  = (long)options.connectTimeoutS,
+		.responseSeconds = (double)options.responseTimeoutS,
+	};
+
 	// main loop: download -> decode -> scale & display -> repeat.
 	//   Timing is governed by the server, which may hold the
 	//   connection open before delivering the next photo.  Any unusual
@@ -1314,7 +1474,7 @@ int		main(int argc, char** argv)
 
 		MemoryBuffer buffer;
 		long httpStatus = 0;
-		int result = downloadURL(options.serviceURL, &buffer, &httpStatus);
+		int result = downloadURL(options.serviceURL, &buffer, &httpStatus, &timeouts);
 
 		if(result == CURLE_OK)
 		{

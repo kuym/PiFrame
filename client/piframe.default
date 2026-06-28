@@ -9,5 +9,8 @@ PIFRAME_URL="http://example.server.url/nextPhoto"
 
 # Extra command-line options. Examples:
 #   -d 5000        minimum milliseconds between photos
-#   -f /dev/fb1    use a different framebuffer  (framebuffer build only)
+#   -f /dev/fb1    use a different framebuffer            (framebuffer build only)
+#   -T 8           completion deadline once the server starts responding, seconds (framebuffer build only)
+#   -t 0           overall request timeout, seconds (0 = unlimited)            (framebuffer build only)
+#   -c 30          connect-phase timeout, seconds                             (framebuffer build only)
 PIFRAME_OPTS=""

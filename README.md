@@ -55,7 +55,17 @@ The framebuffer client (on Raspbian, which ships libjpeg-turbo and libpng):
 
     gcc -o piframe-fb -O3 client/main-fb.c $(pkg-config --cflags --libs libcurl libpng) -ljpeg -lm
 
-The framebuffer edition needs no X server or GTK+.  It puts the active console into graphics mode while running (restoring it on exit) and accepts a couple of extra options: `-f <device>` selects the framebuffer (default `/dev/fb0`) and `-s <file>` selects the startup image (default `startup.jpg`).
+The framebuffer edition needs no X server or GTK+.  It puts the active console into graphics mode while running (restoring it on exit) and accepts these extra options:
+
+  * `-f <device>` — framebuffer device (default `/dev/fb0`)
+  * `-s <file>` — startup image (default `startup.jpg`)
+  * `-t <seconds>` — overall request timeout (default `0`, unlimited)
+  * `-T <seconds>` — completion deadline once the server begins responding (default `8`)
+  * `-c <seconds>` — connect-phase timeout (default `30`)
+
+### Timeouts: patient to start, impatient to finish
+
+PiFrame uses a long-poll model: the server controls refresh timing by holding the connection open until it's ready to send the next photo.  So the client is deliberately *patient* waiting for the server to **begin** responding (no overall timeout by default).  But once the server **starts** sending a response, the client becomes *impatient* — the transfer must complete within `-T` seconds (default 8), otherwise it's aborted and the HUD reports a stalled response.  This closes the gap where a server that starts a response but never finishes (or trickles forever) would otherwise wedge the frame indefinitely.  Set `-T 0` to disable the completion deadline, or `-t` to cap the whole request including the patient wait.
 
 ### Diagnostic HUD (framebuffer edition)
 
@@ -88,6 +98,18 @@ To override the install prefix, pass `PREFIX` (e.g. `sudo make install-fb PREFIX
 ### Hiding the boot console (optional)
 
 On a dedicated frame you'll usually want a clean boot with no login prompt, blinking cursor or kernel messages bleeding through.  The included `setup.sh` script disables the `tty1` getty, quiets the kernel command line and silences `dmesg` on the console.  Review it first, then run it with `sudo sh setup.sh` and reboot.
+
+
+## Testing error handling
+
+`server/server.js` is the normal photo server.  `server/chaos-server.js` is a deliberately misbehaving variant for exercising the client's error handling (and, for the framebuffer edition, its diagnostic HUD).  Every request gets a randomly chosen failure: HTTP error statuses, dropped/half-open connections, malformed image data served as `image/jpeg` or `image/png`, mismatched or bogus MIME types, truncated bodies, lied-about `Content-Length`, hangs, trickled responses and raw non-HTTP garbage.  A small fraction of requests return a genuine image so the client periodically recovers.
+
+    node server/chaos-server.js 3000
+    ./piframe-fb "http://localhost:3000/v1/nextPhoto"
+
+A `/health` endpoint always returns `200 OK` for sanity checks.
+
+The framebuffer client handles the "hang" and "slow trickle" cases via its completion deadline (see *Timeouts* above): it waits patiently for the server to begin responding, then requires the response to finish within `-T` seconds (default 8), surfacing a "Response stalled" HUD otherwise.
 
 
 ## Useful tricks for Raspberry Pi:
