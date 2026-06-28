@@ -85,6 +85,10 @@ install: install-fb
 
 .PHONY: install-fb
 install-fb: piframe-fb install-common
+ifeq ($(DESTDIR),)
+	# Stop any running instance so we don't overwrite a binary that's in use.
+	-systemctl stop piframe.service
+endif
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -m 0755 piframe-fb $(DESTDIR)$(BINDIR)/piframe-fb
 	sed 's|@PREFIX@|$(PREFIX)|g' client/piframe-fb.service.in \
@@ -100,6 +104,10 @@ endif
 
 .PHONY: install-gtk
 install-gtk: piframe install-common
+ifeq ($(DESTDIR),)
+	# Stop any running instance so we don't overwrite a binary that's in use.
+	-systemctl stop piframe.service
+endif
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
 	$(INSTALL) -m 0755 piframe $(DESTDIR)$(BINDIR)/piframe
 	sed 's|@PREFIX@|$(PREFIX)|g' client/piframe.service.in \
