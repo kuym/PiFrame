@@ -1,5 +1,6 @@
 ////////////////////////////////////////////////////////////////
 //
+//
 // PiFrame (framebuffer edition)
 // The Networked Digital Picture Frame for Raspberry Pi
 //
@@ -27,10 +28,9 @@
 //
 // ./piframe-fb "http://10.0.0.84:3000/v1/nextPhoto"
 //
+//
 ////////////////////////////////////////////////////////////////
-
-
-////////////////////////////////////////////////////////////////
+//
 //
 // Useful tricks for development:
 //
@@ -54,10 +54,9 @@
 // Use a different framebuffer device:
 //   ./piframe-fb -f /dev/fb1 "http://.../nextPhoto"
 //
+//
 ////////////////////////////////////////////////////////////////
-
-
-////////////////////////////////////////////////////////////////
+//
 //
 // Tips:
 //
@@ -91,6 +90,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -105,9 +105,9 @@
 #include <png.h>
 
 
-// FBIO_WAITFORVSYNC isn't declared in every <linux/fb.h>, but the
-//   BCM2835 framebuffer driver implements it.  Define it ourselves
-//   if the header didn't.
+// FBIO_WAITFORVSYNC isn't declared in every <linux/fb.h>, but the RPi BCM2835
+//   framebuffer driver implements it.  Define it ourselves if the header
+//   didn't.
 #ifndef FBIO_WAITFORVSYNC
 	#define FBIO_WAITFORVSYNC	_IOW('F', 0x20, __u32)
 #endif
@@ -131,11 +131,10 @@
 
 
 ////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////
 //
-// Image: a simple 24-bit (R,G,B) top-down pixel buffer.  Both
-//   the JPEG and PNG decoders normalise to this format so that
-//   the rest of the program only ever deals with one layout.
+//   Image: a simple 24-bit (R,G,B) top-down pixel buffer.  Both the JPEG and
+// PNG decoders normalise to this format so that the rest of the program only
+// ever deals with one layout.
 //
 ////////////////////////////////////////////////////////////////
 
@@ -159,12 +158,11 @@ static void		ImageFree(Image* image)
 
 
 ////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////
 //
-// Download subsystem: synchronously fetches a URL into a single
-//   contiguous memory buffer using libcurl.  Timing is still
-//   driven by the server (which may hold the connection open
-//   before sending data), exactly as in the GTK+ edition.
+//   Download subsystem: synchronously fetches a URL into a single contiguous
+// memory buffer using libcurl.  Timing is still driven by the server (which may
+// hold the connection open before sending data), exactly as in the GTK+
+// version.
 //
 ////////////////////////////////////////////////////////////////
 
@@ -203,19 +201,28 @@ static size_t	onCURLDownloadSegment(void* segment, size_t count, size_t elements
 	return(segmentLength);
 }
 
+////////////////////////////////////////////////////////////////
+//
+//   Timeout policy:  The intent is to be "patient" while waiting for the server
+// to *begin* responding (the long-poll model lets the server hold the
+// connection open to control refresh timing) but "impatient" once it has begun
+// - the response must then complete quickly so a stalled or trickling transfer
+// can't wedge the frame indefinitely.
+//
+////////////////////////////////////////////////////////////////
 
-// Timeout policy.  The intent is to be "patient" while waiting for the
-//   server to *begin* responding (the long-poll model lets the server
-//   hold the connection open to control refresh timing) but "impatient"
-//   once it has begun - the response must then complete quickly so a
-//   stalled or trickling transfer can't wedge the frame indefinitely.
 typedef struct DownloadTimeouts
 {
-	long	generalSeconds;		// CURLOPT_TIMEOUT, whole request (0 = unlimited)
-	long	connectSeconds;		// CURLOPT_CONNECTTIMEOUT (0 = libcurl default)
+	long		generalSeconds;		// CURLOPT_TIMEOUT, whole request (0 = unlimited)
+	long		connectSeconds;		// CURLOPT_CONNECTTIMEOUT (0 = libcurl default)
 	double	responseSeconds;	// deadline AFTER the server begins responding (0 = unlimited)
 
 } DownloadTimeouts;
+
+
+// Defined with the application below; polled during long transfers so a
+//   replaced framebuffer device is noticed and redrawn promptly.
+static void		screenCheck(void);
 
 
 // Per-transfer timing state shared by the header and progress callbacks.
@@ -236,10 +243,10 @@ static double	monotonicSeconds(void)
 	return((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
 }
 
-// libcurl invokes this for every received header line.  A status line
-//   ("HTTP/...") marks the start of a response, which begins (or, for a
-//   redirect chain / "100 Continue", restarts) the "impatient" completion
-//   clock - so the deadline is always measured from the final response.
+//   libcurl invokes this for every received header line.  A status line
+// ("HTTP/...") marks the start of a response, which begins (or, for a redirect
+// chain / "100 Continue", restarts) the "impatient" completion clock - so the
+// deadline is always measured from the final response.
 static size_t	onCURLHeader(char* buffer, size_t size, size_t nitems, void* user)
 {
 	size_t			length = size * nitems;
@@ -259,14 +266,18 @@ static size_t	onCURLHeader(char* buffer, size_t size, size_t nitems, void* user)
 	return(length);
 }
 
-// libcurl calls this periodically (at least ~once a second) throughout
-//   the transfer, including while idle.  We stay patient until the
-//   response begins, then enforce the completion deadline by returning
-//   non-zero (which aborts with CURLE_ABORTED_BY_CALLBACK).
+//   libcurl calls this periodically (at least ~once a second) throughout the
+// transfer, including while idle.  We stay patient until the response begins,
+// then enforce the completion deadline by returning non-zero (which aborts with
+// CURLE_ABORTED_BY_CALLBACK).
+
 static int		onCURLProgress(void* user, curl_off_t dlTotal, curl_off_t dlNow, curl_off_t ulTotal, curl_off_t ulNow)
 {
 	(void)dlTotal; (void)ulTotal; (void)ulNow;
 	TransferState* state = (TransferState*)user;
+
+	// long polls can idle here for minutes; keep the screen alive meanwhile
+	screenCheck();
 
 	// a body byte is also a clear sign the response has begun (covers
 	//   the rare case of body before any header callback)
@@ -287,11 +298,12 @@ static int		onCURLProgress(void* user, curl_off_t dlTotal, curl_off_t dlNow, cur
 }
 
 
-// Download the given URL.  On success returns CURLE_OK and fills
-//   *outBuffer (caller frees outBuffer->data).  On failure returns
-//   the curl error code and leaves any partial buffer freed.  The
-//   HTTP status code (if any) is reported through *outStatus so the
-//   caller can describe HTTP-level failures in the on-screen HUD.
+//   Download the given URL.  On success returns CURLE_OK and fills *outBuffer
+// (caller frees outBuffer->data).  On failure returns the curl error code and
+// leaves any partial buffer freed.  The HTTP status code (if any) is reported
+// through *outStatus so the caller can describe HTTP-level failures in the
+// on-screen HUD.
+
 static int		downloadURL(char const* url, MemoryBuffer* outBuffer, long* outStatus, DownloadTimeouts const* timeouts)
 {
 	DebugPrintf("+downloadURL %s\n", url);
@@ -324,17 +336,18 @@ static int		downloadURL(char const* url, MemoryBuffer* outBuffer, long* outStatu
 		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeouts->connectSeconds);
 
 	// "impatient once responding" completion deadline, enforced via the
-	//   header + progress callbacks
+	//   header + progress callbacks.  The progress callback is always
+	//   installed since it also watches the framebuffer during the transfer.
 	TransferState state = { 0, 0.0, timeouts->responseSeconds };
 	if(timeouts->responseSeconds > 0.0)
 	{
 		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &onCURLHeader);
 		curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void*)&state);
-
-		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &onCURLProgress);
-		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void*)&state);
 	}
+
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, &onCURLProgress);
+	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void*)&state);
 
 	int result = curl_easy_perform(curl);
 
@@ -357,15 +370,12 @@ static int		downloadURL(char const* url, MemoryBuffer* outBuffer, long* outStatu
 
 
 ////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////
 //
 // Decode subsystem: turns an in-memory JPEG or PNG file into an
 //   Image (24-bit RGB).  The container format is detected from
 //   the file's magic bytes.
 //
 ////////////////////////////////////////////////////////////////
-
-// --- JPEG ---------------------------------------------------- //
 
 // libjpeg's default error handler calls exit() on a fatal error,
 //   which would be rude in a long-running picture frame.  Instead
@@ -436,9 +446,6 @@ static Image*	decodeJPEG(uint8_t const* data, size_t length)
 	return(image);
 }
 
-
-// --- PNG ----------------------------------------------------- //
-
 static Image*	decodePNG(uint8_t const* data, size_t length)
 {
 	DebugPrintf("+decodePNG length=%zu\n", length);
@@ -478,8 +485,6 @@ static Image*	decodePNG(uint8_t const* data, size_t length)
 	return(image);
 }
 
-
-// --- container sniffing -------------------------------------- //
 
 static Image*	decodeImage(uint8_t const* data, size_t length)
 {
@@ -533,49 +538,55 @@ static Image*	decodeImageFile(char const* path)
 
 
 ////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////
 //
-// Framebuffer subsystem: opens, maps and renders to the Linux
-//   framebuffer device.  Handles the common 16-bit (RGB565) and
-//   32-bit (XRGB/ARGB) layouts generically by reading the pixel
-//   bitfield offsets reported by the driver.
+//   Framebuffer subsystem: opens, maps and renders to the Linux framebuffer
+// device.  Handles the common 16-bit (RGB565) and 32-bit (XRGB/ARGB) layouts
+// generically by reading the pixel bitfield offsets reported by the driver.
 //
-//   When the driver exposes a virtual resolution tall enough for
-//   two pages, rendering is double-buffered with page flipping
-//   (FBIOPAN_DISPLAY) for tear-free updates - the framebuffer
-//   analogue of the GTK+ edition's two swapped GtkImage widgets.
-//   Otherwise a single off-screen buffer is composited and then
-//   copied to the visible page in one pass.
+//   When the driver exposes a virtual resolution tall enough for two pages,
+// rendering is double-buffered with page flipping (FBIOPAN_DISPLAY) for
+// tear-free updates - the framebuffer analog of the GTK+ edition's two swapped
+// GtkImage widgets.  Otherwise a single off-screen buffer is composited and
+// then copied to the visible page in one pass.
 //
 ////////////////////////////////////////////////////////////////
 
 typedef struct FrameBuffer
 {
-	int							fd;
+	char const*		device;					// path, kept for reopening
+	int						fd;							// -1 when closed
 
-	struct fb_var_screeninfo	var;
-	struct fb_fix_screeninfo	fix;
+	dev_t					nodeFS;					// identity of the device node we opened,
+	ino_t					nodeIno;				//   to notice if it's replaced
 
-	uint8_t*					mem;		// mmap'd device memory
-	size_t						memLength;
+	struct				fb_var_screeninfo		var;
+	struct				fb_fix_screeninfo		fix;
 
-	int							width;		// visible resolution
-	int							height;
-	int							bytesPerPixel;
-	int							lineLength;	// bytes per row (>= width * bpp)
+	uint8_t*			mem;						// mmap'd device memory
+	size_t				memLength;
 
-	int							pageCount;	// 1 (no flipping) or 2 (page flipping)
-	int							currentPage;
-	int							pendingPage;	// page being drawn before the next flip
+	int						width;					// visible resolution
+	int						height;
+	int						bytesPerPixel;
+	int						lineLength;			// bytes per row (>= width * bpp)
 
-	uint8_t*					backBuffer;	// used only when pageCount == 1
+	int						pageCount;			// 1 (no flipping) or 2 (page flipping)
+	int						currentPage;
+	int						pendingPage;		// page being drawn before the next flip
+
+	uint8_t*			backBuffer;			// used only when pageCount == 1
 
 } FrameBuffer;
 
 
+static void		FrameBufferClose(FrameBuffer* fb);
+
+// Open and map the framebuffer.  On failure 'fb' is left closed (fd == -1)
+//   but remembers 'device', so FrameBufferRevalidate() can retry later.
 static int		FrameBufferOpen(FrameBuffer* fb, char const* device)
 {
 	memset(fb, 0, sizeof(*fb));
+	fb->device = device;
 
 	fb->fd = open(device, O_RDWR);
 	if(fb->fd < 0)
@@ -584,11 +595,18 @@ static int		FrameBufferOpen(FrameBuffer* fb, char const* device)
 		return(-1);
 	}
 
+	struct stat node;
+	if(fstat(fb->fd, &node) == 0)
+	{
+		fb->nodeFS = node.st_dev;
+		fb->nodeIno = node.st_ino;
+	}
+
 	if(ioctl(fb->fd, FBIOGET_VSCREENINFO, &fb->var) < 0 ||
 	   ioctl(fb->fd, FBIOGET_FSCREENINFO, &fb->fix) < 0)
 	{
 		fprintf(stderr, "piframe: can't query framebuffer geometry: %s\n", strerror(errno));
-		close(fb->fd);
+		FrameBufferClose(fb);
 		return(-1);
 	}
 
@@ -600,7 +618,7 @@ static int		FrameBufferOpen(FrameBuffer* fb, char const* device)
 	if((fb->var.bits_per_pixel != 16) && (fb->var.bits_per_pixel != 24) && (fb->var.bits_per_pixel != 32))
 	{
 		fprintf(stderr, "piframe: unsupported framebuffer depth %u bpp (need 16, 24 or 32)\n", fb->var.bits_per_pixel);
-		close(fb->fd);
+		FrameBufferClose(fb);
 		return(-1);
 	}
 
@@ -611,7 +629,8 @@ static int		FrameBufferOpen(FrameBuffer* fb, char const* device)
 	if(fb->mem == MAP_FAILED)
 	{
 		fprintf(stderr, "piframe: can't mmap framebuffer: %s\n", strerror(errno));
-		close(fb->fd);
+		fb->mem = 0;
+		FrameBufferClose(fb);
 		return(-1);
 	}
 
@@ -630,8 +649,7 @@ static int		FrameBufferOpen(FrameBuffer* fb, char const* device)
 		fb->backBuffer = (uint8_t*)malloc((size_t)fb->lineLength * fb->height);
 		if(fb->backBuffer == 0)
 		{
-			munmap(fb->mem, fb->memLength);
-			close(fb->fd);
+			FrameBufferClose(fb);
 			return(-1);
 		}
 	}
@@ -654,8 +672,51 @@ static void		FrameBufferClose(FrameBuffer* fb)
 	if(fb->fd >= 0)
 		close(fb->fd);
 
+	char const* device = fb->device;
 	memset(fb, 0, sizeof(*fb));
+	fb->device = device;
 	fb->fd = -1;
+}
+
+
+// The kernel can replace the framebuffer inode while we're running, so our fd
+//   becomes invalid.  This happens on the Raspberry Pi platform when the driver
+//   is replaced during boot-up (Pis use a temporary fast "simple" driver at
+//   startup which is replaced by the full-featured one during userspace
+//   startup)
+static int		FrameBufferIsStale(FrameBuffer const* fb)
+{
+	if(fb->fd < 0)
+		return(1);
+
+	// the fbdev core rejects ioctls on an unregistered framebuffer
+	struct fb_fix_screeninfo fix;
+	if(ioctl(fb->fd, FBIOGET_FSCREENINFO, &fix) < 0 && errno == ENODEV)
+		return(1);
+
+	// or the path now names a different device node.  If the path is
+	//   missing it's mid-replacement; the next check will catch it.
+	struct stat node;
+	if(stat(fb->device, &node) == 0 &&
+	   (node.st_dev != fb->nodeFS || node.st_ino != fb->nodeIno))
+		return(1);
+
+	return(0);
+}
+
+// Reopen the framebuffer if it has been replaced (or a previous reopen
+//   failed).  Returns 1 if it was reopened and the caller must redraw,
+//   0 if unchanged, or -1 if it is currently unusable (retry later).
+static int		FrameBufferRevalidate(FrameBuffer* fb)
+{
+	if(!FrameBufferIsStale(fb))
+		return(0);
+
+	if(fb->fd >= 0)
+		fprintf(stderr, "piframe: framebuffer \"%s\" was replaced, reopening\n", fb->device);
+
+	FrameBufferClose(fb);
+	return((FrameBufferOpen(fb, fb->device) == 0)? 1 : -1);
 }
 
 
@@ -829,23 +890,23 @@ static void		fillFrame(FrameBuffer* fb, uint8_t* dest, uint8_t r, uint8_t g, uin
 
 
 ////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////
 //
-// HUD overlay: a heads-up display drawn on top of the image whenever
-//   something goes wrong (server unreachable, timeout, TLS failure,
-//   bad HTTP response, undecodable image, ...).  It dims the bottom
-//   ~1/6 of the screen with a 50% gray panel and prints the condition,
-//   the configured server URL and this device's IP address in white
-//   text with a black outline so it stays legible over any picture.
+//   HUD overlay: a heads-up display drawn on top of the image whenever
+// something goes wrong (server unreachable, timeout, TLS failure, bad HTTP
+// response, undecodable image, ...).  It dims the bottom ~1/6 of the screen
+// with a 50% gray panel and prints the condition, the configured server URL
+// and this device's IP address in white text with a black outline so it stays
+// legible over any picture.
 //
-//   Text is drawn with an embedded 8x8 bitmap font (no FreeType / no
-//   external font files), scaled up to suit the display.
+//   Text is drawn with an embedded 8x8 bitmap font (no FreeType / no external
+// font files), scaled up to suit the display.
 //
 ////////////////////////////////////////////////////////////////
 
-// Public-domain 8x8 bitmap font (dhepper/font8x8, "basic" set) covering
-//   printable ASCII 0x20..0x7E.  Each glyph is 8 rows; within a row the
-//   least-significant bit is the leftmost pixel.
+//   Public-domain 8x8 bitmap font (dhepper/font8x8, "basic" set) covering
+// printable ASCII 0x20..0x7E.  Each glyph is 8 rows; within a row the
+// least-significant bit is the leftmost pixel.
+
 static unsigned char const	gFont8x8[95][8] =
 {
 	{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, // ' '
@@ -1075,10 +1136,10 @@ static void		fitText(char* out, size_t outSize, char const* in, int maxChars)
 
 typedef struct Hud
 {
-	int				visible;
-	char			condition[96];		// the unusual condition being reported
-	char const*		url;				// the configured server URL
-	char			ip[64];				// this device's IP address
+	int					visible;
+	char				condition[96];	// the unusual condition being reported
+	char const*	url;						// the configured server URL
+	char				ip[64];					// this device's IP address
 
 } Hud;
 
@@ -1182,6 +1243,9 @@ static void		FrameBufferEndFrame(FrameBuffer* fb)
 //   in which case the frame is cleared to black before the HUD.
 static void		FrameBufferShow(FrameBuffer* fb, Image const* image, Hud const* hud)
 {
+	if(fb->fd < 0)
+		return;	// closed after a failed reopen; redrawn once it's back
+
 	uint8_t* dest = FrameBufferBeginFrame(fb);
 
 	if(image != 0)
@@ -1196,7 +1260,6 @@ static void		FrameBufferShow(FrameBuffer* fb, Image const* image, Hud const* hud
 }
 
 
-////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////
 //
 // Console handling: while PiFrame owns the screen we put the
@@ -1242,7 +1305,6 @@ static void		consoleRestore(void)
 }
 
 
-////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////
 //
 // PiFrame application
@@ -1316,7 +1378,49 @@ static void		parseOptions(AppOptions* outOptions, int argc, char** argv)
 }
 
 
-// Sleep in small slices so we stay responsive to a shutdown signal.
+// What's on screen, so it can be redrawn if the framebuffer is replaced
+//   while we're idle (see FrameBufferIsStale()).  'image' and 'hud' are
+//   owned by main() and stay valid until something else is shown.
+static struct
+{
+	FrameBuffer*	fb;
+	Image const*	image;
+	Hud const*		hud;
+	double				checkedAt;		// monotonic time of the last revalidation
+
+} gScreen;
+
+// Show an image (and optional HUD) and remember it for redrawing.
+static void		screenShow(Image const* image, Hud const* hud)
+{
+	gScreen.image = image;
+	gScreen.hud = hud;
+
+	FrameBufferRevalidate(gScreen.fb);
+	gScreen.checkedAt = monotonicSeconds();
+
+	FrameBufferShow(gScreen.fb, image, hud);
+}
+
+// Cheap enough to call often; revalidates at most once a second and
+//   redraws the current screen if the framebuffer had to be reopened.
+static void		screenCheck(void)
+{
+	if(gScreen.fb == 0)
+		return;
+
+	double now = monotonicSeconds();
+	if(now - gScreen.checkedAt < 1.0)
+		return;
+	gScreen.checkedAt = now;
+
+	if(FrameBufferRevalidate(gScreen.fb) > 0)
+		FrameBufferShow(gScreen.fb, gScreen.image, gScreen.hud);
+}
+
+
+// Sleep in small slices so we stay responsive to a shutdown signal
+//   (and keep the screen alive if the framebuffer is replaced).
 static void		interruptibleSleepMS(unsigned int milliseconds)
 {
 	while(milliseconds > 0 && !gShouldExit)
@@ -1324,6 +1428,8 @@ static void		interruptibleSleepMS(unsigned int milliseconds)
 		unsigned int slice = (milliseconds > 100)? 100 : milliseconds;
 		usleep(slice * 1000);
 		milliseconds -= slice;
+
+		screenCheck();
 	}
 }
 
@@ -1430,6 +1536,8 @@ int		main(int argc, char** argv)
 		return(1);
 	}
 
+	gScreen.fb = &fb;
+
 	// restore the console / framebuffer on Ctrl-C or kill
 	signal(SIGINT, &onSignal);
 	signal(SIGTERM, &onSignal);
@@ -1450,7 +1558,7 @@ int		main(int argc, char** argv)
 	if(lastImage == 0)
 		fprintf(stderr, "piframe: continuing without startup image \"%s\"\n", options.startupImage);
 
-	FrameBufferShow(&fb, lastImage, 0);
+	screenShow(lastImage, 0);
 
 	DebugPrintf("*Using url=\"%s\", fb=\"%s\", delay=%i\n",
 		options.serviceURL, options.framebufferDevice, options.delayMS);
@@ -1482,7 +1590,7 @@ int		main(int argc, char** argv)
 			if(image != 0)
 			{
 				// success: show the new photo (no HUD) and remember it
-				FrameBufferShow(&fb, image, 0);
+				screenShow(image, 0);
 
 				if(lastImage != 0)
 					ImageFree(lastImage);
@@ -1492,7 +1600,7 @@ int		main(int argc, char** argv)
 			{
 				// the response wasn't a PNG/JPEG we could decode
 				hudReport(&hud, "Malformed image data from server");
-				FrameBufferShow(&fb, lastImage, &hud);
+				screenShow(lastImage, &hud);
 				delay = 10000;	// 10 seconds
 			}
 		}
@@ -1502,14 +1610,14 @@ int		main(int argc, char** argv)
 			char condition[96];
 			snprintf(condition, sizeof(condition), "Server returned HTTP %ld", httpStatus);
 			hudReport(&hud, condition);
-			FrameBufferShow(&fb, lastImage, &hud);
+			screenShow(lastImage, &hud);
 			delay = 10000;	// 10 seconds
 		}
 		else
 		{
 			// network / TLS / protocol level failure
 			hudReport(&hud, describeCurlError(result));
-			FrameBufferShow(&fb, lastImage, &hud);
+			screenShow(lastImage, &hud);
 			delay = 10000;	// 10 seconds
 		}
 
